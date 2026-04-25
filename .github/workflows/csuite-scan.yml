@@ -1,98 +1,72 @@
-name: C-Suite Weekly Intelligence Scan
+name: C-Suite Intelligence Daily Brief
 
 on:
   schedule:
-    # Every Monday 02:30 UTC = 08:00 IST
-    - cron: '30 2 * * 1'
-  workflow_dispatch:  # allows manual trigger from GitHub UI
+    - cron: '30 3 * * *'  # 9:00 AM IST = 3:30 AM UTC
+  workflow_dispatch:       # allows manual trigger from GitHub UI
 
 jobs:
-  run-scan:
+  run-intelligence-brief:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
 
     steps:
-      - name: Run C-Suite Intelligence Scan
+      - name: Trigger C-Suite Intelligence Agent
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          AGENT_ID: ${{ secrets.AGENT_ID }}
+          AGENT_ID: agent_011CaQeXkKf1bVT8P5JrFdMW   # your agent ID
           ENVIRONMENT_ID: ${{ secrets.ENVIRONMENT_ID }}
-          VAULT_ID: ${{ secrets.VAULT_ID }}
+          VAULT_ID: vlt_011Ca1chDCvs1eY521YAdFQU
         run: |
-          python3 - <<'EOF'
-          import os, json, time, urllib.request, urllib.error
+          # 1. Create a session
+          SESSION=$(curl -s -X POST https://api.anthropic.com/v1/sessions \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "anthropic-beta: managed-agents-2026-04-01" \
+            -H "content-type: application/json" \
+            -d "{
+              \"agent\": \"$AGENT_ID\",
+              \"environment_id\": \"$ENVIRONMENT_ID\",
+              \"vault_ids\": [\"$VAULT_ID\"],
+              \"title\": \"Daily Brief $(date +'%Y-%m-%d')\"
+            }")
 
-          API_KEY = os.environ["ANTHROPIC_API_KEY"]
-          AGENT_ID = os.environ["AGENT_ID"]
-          ENVIRONMENT_ID = os.environ["ENVIRONMENT_ID"]
-          VAULT_ID = os.environ["VAULT_ID"]
-          BASE = "https://api.anthropic.com"
-          HEADERS = {
-              "x-api-key": API_KEY,
-              "anthropic-version": "2023-06-01",
-              "anthropic-beta": "managed-agents-2026-04-01",
-              "content-type": "application/json",
-          }
+          SESSION_ID=$(echo $SESSION | jq -r '.id')
+          echo "Session created: $SESSION_ID"
 
-          def api(method, path, body=None):
-              req = urllib.request.Request(
-                  f"{BASE}{path}",
-                  data=json.dumps(body).encode() if body else None,
-                  headers=HEADERS,
-                  method=method,
-              )
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return json.loads(r.read())
+          # 2. Send the trigger message
+          curl -s -X POST "https://api.anthropic.com/v1/sessions/$SESSION_ID/events" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "anthropic-beta: managed-agents-2026-04-01" \
+            -H "content-type: application/json" \
+            -d '{
+              "events": [{
+                "type": "user.message",
+                "content": [{"type": "text", "text": "Run today'\''s C-suite intelligence scan and post the brief to #c-suite-intelligence."}]
+              }]
+            }'
 
-          # 1. Create session
-          print("Creating session...")
-          session = api("POST", "/v1/sessions", {
-              "agent": AGENT_ID,
-              "environment_id": ENVIRONMENT_ID,
-              "vault_ids": [VAULT_ID],
-              "title": f"Weekly C-Suite Scan",
-          })
-          sid = session["id"]
-          print(f"Session: {sid}")
+          echo "Message sent. Agent is running."
 
-          # 2. Wait for session to become running/idle
-          for _ in range(30):
-              s = api("GET", f"/v1/sessions/{sid}")
-              if s["status"] in ("running", "idle"):
-                  break
-              time.sleep(5)
+          # 3. Poll until session goes idle (agent done)
+          for i in $(seq 1 60); do
+            sleep 30
+            STATUS=$(curl -s "https://api.anthropic.com/v1/sessions/$SESSION_ID" \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "anthropic-beta: managed-agents-2026-04-01" \
+              | jq -r '.status')
+            echo "[$i] Session status: $STATUS"
+            if [ "$STATUS" = "idle" ]; then
+              echo "✅ Agent completed successfully."
+              break
+            fi
+          done
 
-          # 3. Send scan trigger
-          api("POST", f"/v1/sessions/{sid}/events", {
-              "events": [{"type": "user.message", "content": [
-                  {"type": "text", "text": "Run this week's C-suite intelligence scan now."}
-              ]}]
-          })
-          print("Scan triggered. Polling for completion...")
+          # 4. Archive the session
+          curl -s -X POST "https://api.anthropic.com/v1/sessions/$SESSION_ID/archive" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "anthropic-beta: managed-agents-2026-04-01"
 
-          # 4. Poll for idle (scan complete)
-          last_id = None
-          for attempt in range(120):  # up to 20 min
-              time.sleep(10)
-              s = api("GET", f"/v1/sessions/{sid}")
-              if s["status"] == "idle":
-                  print("Scan complete.")
-                  break
-              if attempt % 6 == 0:
-                  print(f"Still running... ({attempt * 10}s elapsed)")
-
-          # 5. Print last agent message
-          events = api("GET", f"/v1/sessions/{sid}/events?limit=50")
-          for ev in reversed(events.get("data", [])):
-              if ev.get("type") == "agent.message":
-                  content = ev.get("content", [])
-                  for block in content:
-                      if block.get("type") == "text":
-                          print("\n--- AGENT OUTPUT ---")
-                          print(block["text"])
-                  break
-
-          # 6. Archive session
-          api("POST", f"/v1/sessions/{sid}/archive")
-          print("Session archived.")
-          EOF
+          echo "Session archived."
