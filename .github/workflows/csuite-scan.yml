@@ -1,165 +1,32 @@
-#!/usr/bin/env python3
-"""
-C-Suite Intelligence Brief runner — weekly Monday edition.
-Window: last Monday 08:00 IST → this Monday 08:00 IST (exactly 7 days).
-"""
+name: C-Suite Intelligence Brief
 
-import os
-import sys
-from datetime import datetime, timedelta
-import pytz
-import anthropic
+on:
+  schedule:
+    - cron: '30 2 * * 1'   # Every Monday 08:00 IST (02:30 UTC)
+  workflow_dispatch:        # Manual trigger for testing
 
-# ── Config ────────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-AGENT_ID          = os.environ["AGENT_ID"]
-ENVIRONMENT_ID    = os.environ["ENVIRONMENT_ID"]
-MEMORY_STORE_ID   = os.environ["MEMORY_STORE_ID"]
-VAULT_ID          = os.environ["VAULT_ID"]
+jobs:
+  run-brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
-IST = pytz.timezone("Asia/Kolkata")
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-# ── Compute window ─────────────────────────────────────────────────────────────
-def compute_window():
-    now_ist = datetime.now(IST)
-    # Snap to Monday 08:00 IST regardless of cron drift
-    window_end   = now_ist.replace(hour=8, minute=0, second=0, microsecond=0)
-    window_start = window_end - timedelta(days=7)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-    fmt = "%d %b %Y %H:%M IST"
-    return "MONDAY", window_start.strftime(fmt), window_end.strftime(fmt)
+      - name: Install dependencies
+        run: pip install anthropic pytz
 
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-def main():
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    run_day, window_start, window_end = compute_window()
-    print(f"[runner] RUN_DAY={run_day}  WINDOW: {window_start} → {window_end}")
-    print(f"[runner] Memory store: {MEMORY_STORE_ID}")
-    print(f"[runner] Vault: {VAULT_ID}")
-
-    user_message = (
-        f"RUN_DAY: {run_day}\n"
-        f"WINDOW_START: {window_start}\n"
-        f"WINDOW_END: {window_end}\n\n"
-        "Execute the full intelligence scan for this 7-day window. "
-        "Deduplicate against /mnt/memory/seen-roles/ before composing the brief, "
-        "then post to #c-suite-intelligence on Slack, "
-        "then write new seen-role files for every role included in this brief."
-    )
-
-    # ── Create session ─────────────────────────────────────────────────────────
-    session = client.beta.sessions.create(
-        agent=AGENT_ID,
-        environment_id=ENVIRONMENT_ID,
-        title=f"C-Suite Brief — {run_day} {window_end}",
-        vault_ids=[VAULT_ID],
-        resources=[
-            {
-                "type": "memory_store",
-                "memory_store_id": MEMORY_STORE_ID,
-                "access": "read_write",
-                "instructions": (
-                    "Seen-roles deduplication store. "
-                    "Read before composing the brief to suppress already-reported roles. "
-                    "Write a new .json file for each new role AFTER the Slack post is attempted. "
-                    "Never delete or modify existing entries."
-                ),
-            }
-        ],
-    )
-    print(f"[runner] Session created: {session.id}")
-
-    # ── Send first message ─────────────────────────────────────────────────────
-    client.beta.sessions.events.send(
-        session_id=session.id,
-        events=[{
-            "type": "user.message",
-            "content": [{"type": "text", "text": user_message}],
-        }],
-    )
-    print("[runner] Message sent. Streaming events...")
-
-    # ── Stream until idle ──────────────────────────────────────────────────────
-    slack_posted       = False
-    agent_output_lines = []
-
-    with client.beta.sessions.events.stream(session_id=session.id) as stream:
-        for event in stream:
-            etype = getattr(event, "type", None)
-
-            if etype == "agent.message":
-                for block in getattr(event, "content", []):
-                    if getattr(block, "type", None) == "text":
-                        agent_output_lines.append(block.text)
-                        print(f"[agent] {block.text[:120]}")
-
-            elif etype == "agent.tool_use":
-                print(f"[tool]  Built-in: {getattr(event, 'name', 'unknown')}")
-
-            elif etype == "agent.mcp_tool_use":
-                tool_name = getattr(event, "name", "unknown")
-                print(f"[tool]  MCP: {tool_name}")
-                if "post" in str(tool_name).lower():
-                    slack_posted = True
-
-            elif etype == "agent.mcp_tool_result":
-                result_str = str(getattr(event, "content", ""))
-                if '"ok":true' in result_str or '"ok": true' in result_str:
-                    slack_posted = True
-                    print("[runner] Slack post confirmed OK.")
-
-            elif etype == "session.status_idle":
-                stop_type = getattr(getattr(event, "stop_reason", None), "type", "unknown")
-                print(f"[runner] Session idle — stop_reason: {stop_type}")
-                if stop_type != "requires_action":
-                    break
-
-            elif etype == "session.status_terminated":
-                print("[runner] Session terminated unexpectedly.")
-                sys.exit(1)
-
-            elif etype == "session.error":
-                err = getattr(event, "error", None)
-                err_type = getattr(err, "type", "") if err else ""
-                msg = getattr(err, "message", str(event)) if err else str(event)
-                print(f"[runner] ERROR ({err_type}): {msg}")
-                # MCP auth failure is fatal — exit so GitHub Actions marks the run red
-                if err_type == "mcp_authentication_failed_error":
-                    print("[runner] FATAL: Slack vault credential mismatch. "
-                          "Re-authorize Slack in the vault and ensure the URL "
-                          "matches exactly: https://mcp.slack.com/mcp")
-                    sys.exit(1)
-
-            elif etype == "agent.tool_result":
-                # Log web_fetch errors for visibility but don't abort
-                content = getattr(event, "content", [])
-                for block in content:
-                    text = getattr(block, "text", "")
-                    if "error" in text.lower():
-                        print(f"[tool]  Fetch error (non-fatal): {text[:100]}")
-
-    # ── Summary ────────────────────────────────────────────────────────────────
-    print("\n" + "─" * 60)
-    if slack_posted:
-        print("✅  Slack post confirmed.")
-    else:
-        print("⚠️  Slack post not confirmed — check agent output below.")
-        if agent_output_lines:
-            print("\n--- Agent fallback output ---")
-            print("\n".join(agent_output_lines))
-
-    print("\n[memory] Current seen-roles count:")
-    try:
-        memories = client.beta.memory_stores.memories.list(MEMORY_STORE_ID)
-        count = sum(1 for m in memories if getattr(m, "type", None) == "memory")
-        print(f"  {count} roles on record.")
-    except Exception as e:
-        print(f"  Could not read memory store: {e}")
-
-    print(f"\n[runner] Session {session.id} complete.")
-
-
-if __name__ == "__main__":
-    main()
+      - name: Run intelligence brief
+        env:
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          AGENT_ID:           ${{ secrets.AGENT_ID }}
+          ENVIRONMENT_ID:     ${{ secrets.ENVIRONMENT_ID }}
+          MEMORY_STORE_ID:    ${{ secrets.MEMORY_STORE_ID }}
+          VAULT_ID:           ${{ secrets.VAULT_ID }}
+        run: python scripts/run_brief.py
